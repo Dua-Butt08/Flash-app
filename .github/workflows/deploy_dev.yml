@@ -1,0 +1,23 @@
+name: Release - Dev
+
+on:
+  workflow_run:
+    workflows: ["Build - Dev"]
+    types:
+      - completed
+
+jobs:
+  deploy:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.1.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd /var/www/projects/project-name
+            sudo ./update.sh
+

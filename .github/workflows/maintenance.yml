@@ -1,0 +1,129 @@
+
+name: Weekly Maintenance
+on:
+  schedule:
+    - cron: "0 0 * * 0" # Every Sunday at midnight
+  workflow_dispatch: # Manual trigger option
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      # 3️⃣ Get Secrets From Key Vault
+      - name: Get Secrets From Key Vault
+        id: kv
+        uses: azure/get-keyvault-secrets@v1
+        with:
+          keyvault: octcer-secret-vault
+          secrets:  ANTHROPIC-API-KEY, GHCR-TOKEN
+      # ✅ Provide a real 'unzip' implemented in Python (no packages required)
+      - name: Provide unzip (Python with mode restore)
+        id: unzip_py
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHIM_DIR="${RUNNER_TEMP}/shim"
+          mkdir -p "$SHIM_DIR"
+      
+          cat > "$SHIM_DIR/unzip" <<'PYSHIM'
+          #!/usr/bin/env python3
+          import sys, os, zipfile, stat
+          
+          # Minimal unzip compatible with: unzip [-q] [-o] file.zip [-d DIR]
+          args = sys.argv[1:]
+          quiet = False
+          zip_path = None
+          dest = "."
+          
+          i = 0
+          while i < len(args):
+              a = args[i]
+              if a == "-q":
+                  quiet = True
+                  i += 1
+              elif a == "-o":
+                  # overwrite is default for our extractor
+                  i += 1
+              elif a == "-d" and i + 1 < len(args):
+                  dest = args[i+1]
+                  i += 2
+              elif a.startswith("-"):
+                  # ignore unknown flags
+                  i += 1
+              else:
+                  zip_path = a
+                  i += 1
+          
+          if not zip_path:
+              sys.stderr.write("usage: unzip file.zip [-d DIR]\n")
+              sys.exit(1)
+          
+          os.makedirs(dest, exist_ok=True)
+          
+          with zipfile.ZipFile(zip_path) as zf:
+              # Extract each entry and restore UNIX permissions from external_attr
+              for zi in zf.infolist():
+                  target = os.path.join(dest, zi.filename)
+                  if zi.is_dir() or zi.filename.endswith("/"):
+                      os.makedirs(target, exist_ok=True)
+                      continue
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  with zf.open(zi, "r") as src, open(target, "wb") as dst:
+                      dst.write(src.read())
+          
+                  # Restore mode if present (upper 16 bits)
+                  mode = (zi.external_attr >> 16) & 0o7777
+                  if mode:
+                      try:
+                          os.chmod(target, mode)
+                      except Exception:
+                          pass
+          
+                  # Ensure the bun binary is executable even if mode wasn't preserved
+                  base = os.path.basename(target)
+                  if base == "bun":
+                      try:
+                          st = os.stat(target)
+                          os.chmod(target, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                      except Exception:
+                          pass
+          
+          if not quiet:
+              print(f"Extracted {zip_path} to {dest}")
+          PYSHIM
+          
+              chmod +x "$SHIM_DIR/unzip"
+              echo "$SHIM_DIR" >> "$GITHUB_PATH"
+
+
+      - name: Check unzip availability
+        run: |
+          which unzip || true
+          unzip -h || true
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ steps.kv.outputs['ANTHROPIC-API-KEY'] }}
+          github_token: ${{ steps.kv.outputs['GHCR-TOKEN'] }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            Perform weekly repository maintenance:
+            1. Check for outdated dependencies in package.json
+            2. Scan for security vulnerabilities using `npm audit`
+            3. Review open issues older than 90 days
+            4. Check for TODO comments in recent commits
+            5. Verify README.md examples still work
+            Create a single issue summarizing any findings.
+            If critical security issues are found, also comment on open PRs.
+          claude_args: |
+            --allowedTools "Read,Bash(npm:*),Bash(gh issue:*),Bash(git:*)"
+

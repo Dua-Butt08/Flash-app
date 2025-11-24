@@ -1,0 +1,236 @@
+
+name: PR Build + Smart Review
+
+on:
+  pull_request:
+    branches: [dev, main]
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  # Job 1: Always build and push Docker image
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # 1️⃣ Checkout
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # 2️⃣ Login to Azure
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 3️⃣ Get Secrets From Key Vault
+      - name: Get Secrets From Key Vault
+        id: kv
+        uses: azure/get-keyvault-secrets@v1
+        with:
+          keyvault: octcer-secret-vault
+          secrets: GHCR-USERNAME, GHCR-TOKEN
+
+      # 4️⃣ Docker build
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ steps.kv.outputs['GHCR-USERNAME'] }}
+          password: ${{ steps.kv.outputs['GHCR-TOKEN'] }}
+
+      - name: Set lowercase repository name
+        run: echo "REPO_NAME=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ghcr.io/${{ env.REPO_NAME }}-dev:latest
+
+  # Job 2: Conditional Claude Code Review
+  # - Always runs for PRs to main
+  # - Only runs for PRs to dev when labeled with 'needs-review'
+  # - Depends on build job (only runs if build succeeds)
+  review:
+    runs-on: octacer_info
+    needs: build  # Wait for build to complete successfully
+    if: |
+      github.event.pull_request.base.ref == 'main' ||
+      (github.event.pull_request.base.ref == 'dev' && contains(github.event.pull_request.labels.*.name, 'needs-review'))
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get Secrets From Key Vault
+        id: kv
+        uses: azure/get-keyvault-secrets@v1
+        with:
+          keyvault: octcer-secret-vault
+          secrets: ANTHROPIC-API-KEY, GHCR-TOKEN
+
+      # Provide unzip for bun installation
+      - name: Provide unzip (Python)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHIM_DIR="${RUNNER_TEMP}/shim"
+          mkdir -p "$SHIM_DIR"
+
+          cat > "$SHIM_DIR/unzip" <<'PYSHIM'
+          #!/usr/bin/env python3
+          import sys, os, zipfile, stat
+
+          args = sys.argv[1:]
+          quiet = False
+          zip_path = None
+          dest = "."
+
+          i = 0
+          while i < len(args):
+              a = args[i]
+              if a == "-q":
+                  quiet = True
+                  i += 1
+              elif a == "-o":
+                  i += 1
+              elif a == "-d" and i + 1 < len(args):
+                  dest = args[i+1]
+                  i += 2
+              elif a.startswith("-"):
+                  i += 1
+              else:
+                  zip_path = a
+                  i += 1
+
+          if not zip_path:
+              sys.stderr.write("usage: unzip file.zip [-d DIR]\n")
+              sys.exit(1)
+
+          os.makedirs(dest, exist_ok=True)
+
+          with zipfile.ZipFile(zip_path) as zf:
+              for zi in zf.infolist():
+                  target = os.path.join(dest, zi.filename)
+                  if zi.is_dir() or zi.filename.endswith("/"):
+                      os.makedirs(target, exist_ok=True)
+                      continue
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  with zf.open(zi, "r") as src, open(target, "wb") as dst:
+                      dst.write(src.read())
+
+                  mode = (zi.external_attr >> 16) & 0o7777
+                  if mode:
+                      try:
+                          os.chmod(target, mode)
+                      except Exception:
+                          pass
+
+                  base = os.path.basename(target)
+                  if base == "bun":
+                      try:
+                          st = os.stat(target)
+                          os.chmod(target, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                      except Exception:
+                          pass
+
+          if not quiet:
+              print(f"Extracted {zip_path} to {dest}")
+          PYSHIM
+
+          chmod +x "$SHIM_DIR/unzip"
+          echo "$SHIM_DIR" >> "$GITHUB_PATH"
+
+      - name: Claude PR Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ steps.kv.outputs['ANTHROPIC-API-KEY'] }}
+          github_token: ${{ steps.kv.outputs['GHCR-TOKEN'] }}
+          model: ${{ github.event.pull_request.base.ref == 'main' && 'sonnet' || 'haiku' }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            TARGET BRANCH: ${{ github.event.pull_request.base.ref }}
+
+            ${{ github.event.pull_request.base.ref == 'main' && '
+            ## COMPLETE PROJECT REVIEW (Production Release)
+            This PR targets MAIN (production). Perform a COMPREHENSIVE review of the ENTIRE PROJECT.
+
+            ### Review Scope:
+            1. Review ALL critical source files (src/, components/, etc.)
+            2. Check for bugs, security issues, and broken functionality
+            3. Verify no hardcoded secrets anywhere in the codebase
+            4. Check authentication/authorization logic
+            5. Review API endpoints and data handling
+
+            ### What to Flag:
+            🔴 Critical bugs that will break production
+            🔴 Security vulnerabilities anywhere in codebase
+            🔴 Hardcoded secrets or credentials
+            🔴 Broken authentication/authorization
+            🔴 Data exposure or privacy issues
+
+            ### Still IGNORE:
+            ⛔ Code style or formatting
+            ⛔ Performance optimizations
+            ⛔ SEO improvements
+            ⛔ Refactoring suggestions
+
+            ### Output:
+            - Flag ALL critical issues found in the project
+            - Group by severity (Critical, High, Medium)
+            - Provide file path and line number for each issue
+            - Summary: "Production Review Complete: X critical issues found" or "✅ Production ready - no critical issues"
+            ' || '
+            ## CHANGED FILES REVIEW (Development)
+            This PR targets DEV. Review ONLY the changed files for CRITICAL issues.
+
+            ### STRICT RULES:
+            1. ONLY review code that was CHANGED in this PR
+            2. ONLY flag CRITICAL bugs and security issues
+            3. NO optimization suggestions (performance, SEO, etc.)
+            4. NO "while you are at it" or "consider also" suggestions
+            5. NO cascading improvements or refactoring suggestions
+            6. If no critical issues found: Post "✅ No critical issues found"
+
+            ### What to Flag (CRITICAL ONLY):
+            🔴 Actual bugs that will break functionality
+            🔴 Security vulnerabilities (XSS, SQL injection, auth bypass)
+            🔴 Syntax errors or crashes
+            🔴 Hardcoded secrets or credentials
+
+            ### What to IGNORE:
+            ⛔ Code style or formatting
+            ⛔ Performance optimizations
+            ⛔ SEO improvements
+            ⛔ Refactoring suggestions
+            ⛔ "Could be better" observations
+            ⛔ Unchanged code in the file
+
+            ### Format:
+            - One inline comment per issue ONLY if critical
+            - Maximum 1 sentence: "Bug: [what breaks] - Fix: [how]"
+            - ONE summary: "✅ No critical issues" or "⚠️ Found X critical issues"
+
+            IMPORTANT: Focus ONLY on what changed. NO improvement suggestions.
+            ' }}
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"

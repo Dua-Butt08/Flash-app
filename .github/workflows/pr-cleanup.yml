@@ -1,0 +1,81 @@
+name: PR Branch Cleanup
+
+on:
+    pull_request:
+      types: [closed]
+      branches:
+        - main
+        - dev
+
+jobs:
+    cleanup:
+      # Only run if PR was merged (not just closed)
+      if: github.event.pull_request.merged == true
+      runs-on: ubuntu-latest
+      permissions:
+        contents: write
+        pull-requests: write  # ← Changed from 'read' to 'write'
+
+      steps:
+        - name: Check source branch
+          id: check-branch
+          run: |
+            SOURCE_BRANCH="${{ github.event.pull_request.head.ref }}"
+            echo "Source branch: $SOURCE_BRANCH"
+            # Check if source branch is 'main' or 'dev' - these are protected
+            if [ "$SOURCE_BRANCH" = "main" ] || [ "$SOURCE_BRANCH" = "dev" ]; then
+              echo "should_delete=false" >> $GITHUB_OUTPUT
+              echo "Source branch is '$SOURCE_BRANCH' - will not delete (protected branch)"
+            else
+              echo "should_delete=true" >> $GITHUB_OUTPUT
+              echo "Source branch is '$SOURCE_BRANCH' - will delete"
+            fi
+
+        - name: Delete branch
+          if: steps.check-branch.outputs.should_delete == 'true'
+          uses: actions/github-script@v7
+          with:
+            script: |
+              const branchName = context.payload.pull_request.head.ref;
+              const owner = context.repo.owner;
+              const repo = context.repo.repo;
+
+              try {
+                await github.rest.git.deleteRef({
+                  owner: owner,
+                  repo: repo,
+                  ref: `heads/${branchName}`
+                });
+                console.log(`Successfully deleted branch: ${branchName}`);
+
+                // Add comment to PR
+                await github.rest.issues.createComment({
+                  owner: owner,
+                  repo: repo,
+                  issue_number: context.issue.number,
+                  body: `🧹 Branch \`${branchName}\` has been automatically deleted after merge.`
+                });
+              } catch (error) {
+                console.log(`Failed to delete branch ${branchName}: ${error.message}`);
+
+                // Add comment about failure
+                await github.rest.issues.createComment({
+                  owner: owner,
+                  repo: repo,
+                  issue_number: context.issue.number,
+                  body: `⚠️ Failed to automatically delete branch \`${branchName}\`: ${error.message}`
+                });
+              }
+
+        - name: Skip deletion notice
+          if: steps.check-branch.outputs.should_delete == 'false'
+          uses: actions/github-script@v7
+          with:
+            script: |
+              const branchName = context.payload.pull_request.head.ref;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `ℹ️ Branch \`${branchName}\` was not deleted as it is a protected branch (main/dev).`
+              });
